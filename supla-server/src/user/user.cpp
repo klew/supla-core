@@ -255,6 +255,28 @@ supla_user *supla_user::find_by_suid(const char *suid) {
   return user;
 }
 
+// static
+int supla_user::suid_to_user_id(const char *suid, bool use_database) {
+  supla_user *user = find_by_suid(suid);
+  if (user) {
+    return user->getUserID();
+  }
+
+  int result = 0;
+
+  if (use_database) {
+    database *db = new database();
+
+    if (db->connect() == true) {
+      result = db->get_user_id_by_suid(suid);
+    }
+
+    delete db;
+  }
+
+  return result;
+}
+
 supla_user *supla_user::add_device(supla_device *device, int UserID) {
   supla_user *user = find(UserID, true);
 
@@ -629,10 +651,14 @@ supla_device *supla_user::device_by_channelid(int ChannelID) {
 }
 
 bool supla_user::get_channel_value(int DeviceID, int ChannelID,
-                                   TSuplaChannelValue *value, char *online,
-                                   unsigned _supla_int_t *validity_time_sec) {
+                                   char value[SUPLA_CHANNELVALUE_SIZE],
+                                   char sub_value[SUPLA_CHANNELVALUE_SIZE],
+                                   char *sub_value_type, char *online,
+                                   unsigned _supla_int_t *validity_time_sec,
+                                   bool for_client) {
   bool result = false;
-  memset(value, 0, sizeof(TSuplaChannelValue));
+  memset(value, 0, SUPLA_CHANNELVALUE_SIZE);
+  memset(sub_value, 0, SUPLA_CHANNELVALUE_SIZE);
   if (online) {
     *online = 0;
   }
@@ -641,19 +667,26 @@ bool supla_user::get_channel_value(int DeviceID, int ChannelID,
   supla_device *device = device_container->findByID(DeviceID);
   if (device) {
     result = device->get_channels()->get_channel_value(
-        ChannelID, value->value, online, validity_time_sec);
+        ChannelID, value, online, validity_time_sec, for_client);
 
     if (result) {
       std::list<int> related_list =
           device->get_channels()->related_channel(ChannelID);
 
       std::list<int>::iterator it = related_list.begin();
+      bool sub_value_exists = false;
+      char sub_channel_online = 0;
 
       if (related_list.size() == 1 && *it > 0) {
         related_device = device_container->findByChannelID(*it);
         if (related_device) {
-          related_device->get_channels()->get_channel_value(
-              *it, value->sub_value, NULL, NULL);
+          if (related_device->get_channels()->get_channel_value(
+                  *it, sub_value, &sub_channel_online, NULL, for_client) &&
+              sub_channel_online) {
+            sub_value_exists = true;
+          } else {
+            memset(sub_value, 0, SUPLA_CHANNELVALUE_SIZE);
+          }
           related_device->releasePtr();
           related_device = NULL;
         }
@@ -662,15 +695,20 @@ bool supla_user::get_channel_value(int DeviceID, int ChannelID,
         // copy only first byte of sub_value
         // At this version only SENSORNO/SENSORNC are supported.
         // See supla_device_channel::related_channel
-        char sub_value[SUPLA_CHANNELVALUE_SIZE];
+        char _sub_value[SUPLA_CHANNELVALUE_SIZE];
         int n = 0;
         do {
           if (*it > 0) {
             related_device = device_container->findByChannelID(*it);
             if (related_device) {
-              related_device->get_channels()->get_channel_value(*it, sub_value,
-                                                                NULL, NULL);
-              value->sub_value[n] = sub_value[0];
+              sub_channel_online = false;
+              if (related_device->get_channels()->get_channel_value(
+                      *it, _sub_value, &sub_channel_online, NULL, for_client) &&
+                  sub_channel_online) {
+                sub_value[n] = _sub_value[0];
+                sub_value_exists = true;
+              }
+
               related_device->releasePtr();
               related_device = NULL;
             }
@@ -679,114 +717,56 @@ bool supla_user::get_channel_value(int DeviceID, int ChannelID,
           it++;
         } while (it != related_list.end() && n < SUPLA_CHANNELVALUE_SIZE);
       }
+
+      if (sub_value_type) {
+        it = related_list.begin();
+        *sub_value_type = SUBV_TYPE_NOT_SET_OR_OFFLINE;
+
+        if (sub_value_exists && related_list.size() > 0 && *it > 0) {
+          related_device = device_container->findByChannelID(*it);
+          if (related_device) {
+            int rel_channel_func =
+                related_device->get_channels()->get_channel_func(*it);
+
+#ifdef SERVER_VERSION_23
+            int rel_channel_type =
+                related_device->get_channels()->get_channel_type(*it);
+#endif /*SERVER_VERSION_23*/
+
+            related_device->releasePtr();
+            related_device = NULL;
+
+            switch (rel_channel_func) {
+              case SUPLA_CHANNELFNC_OPENINGSENSOR_GATEWAY:
+              case SUPLA_CHANNELFNC_OPENINGSENSOR_GATE:
+              case SUPLA_CHANNELFNC_OPENINGSENSOR_GARAGEDOOR:
+              case SUPLA_CHANNELFNC_OPENINGSENSOR_DOOR:
+              case SUPLA_CHANNELFNC_OPENINGSENSOR_ROLLERSHUTTER:
+              case SUPLA_CHANNELFNC_OPENINGSENSOR_ROOFWINDOW:
+                *sub_value_type = SUBV_TYPE_SENSOR;
+                break;
+              case SUPLA_CHANNELFNC_ELECTRICITY_METER:
+                *sub_value_type = SUBV_TYPE_ELECTRICITY_MEASUREMENTS;
+#ifdef SERVER_VERSION_23
+                if (rel_channel_type == SUPLA_CHANNELTYPE_IMPULSE_COUNTER) {
+                  *sub_value_type = SUBV_TYPE_IC_MEASUREMENTS;
+                }
+#endif /*SERVER_VERSION_23*/
+                break;
+              case SUPLA_CHANNELFNC_IC_ELECTRICITY_METER:
+              case SUPLA_CHANNELFNC_IC_GAS_METER:
+              case SUPLA_CHANNELFNC_IC_WATER_METER:
+              case SUPLA_CHANNELFNC_IC_HEAT_METER:
+                *sub_value_type = SUBV_TYPE_IC_MEASUREMENTS;
+                break;
+            }
+          }
+        }
+      }
     }
 
     device->releasePtr();
   }
-
-  return result;
-}
-
-bool supla_user::get_channel_extendedvalue(int DeviceID, int ChannelID,
-                                           TSuplaChannelExtendedValue *value) {
-  bool result = false;
-  memset(value, 0, sizeof(TSuplaChannelExtendedValue));
-
-  supla_device *device = device_container->findByID(DeviceID);
-  if (device) {
-    result =
-        device->get_channels()->get_channel_extendedvalue(ChannelID, value);
-    device->releasePtr();
-  }
-
-  return result;
-}
-
-// static
-bool supla_user::set_device_channel_char_value(
-    int UserID, int SenderID, int DeviceID, int ChannelID, int GroupID,
-    unsigned char EOL, const char value, event_source_type eventSourceType,
-    char *AlexaCorrelationToken, char *GoogleRequestId) {
-  bool result = false;
-
-  safe_array_lock(supla_user::user_arr);
-  supla_user *user =
-      (supla_user *)safe_array_findcnd(user_arr, find_user_by_id, &UserID);
-  safe_array_unlock(supla_user::user_arr);
-
-  if (user) {
-    if (eventSourceType > 0) {
-      // TODO(anyone): Check it out. I think there should be "will change"
-      supla_http_request_queue::getInstance()->onChannelValueChangeEvent(
-          user, DeviceID, ChannelID, eventSourceType, AlexaCorrelationToken,
-          GoogleRequestId);
-    }
-
-    result = user->set_device_channel_char_value(SenderID, DeviceID, ChannelID,
-                                                 GroupID, EOL, value) == true;
-  }
-
-  return result;
-}
-
-// static
-bool supla_user::set_device_channel_rgbw_value(
-    int UserID, int SenderID, int DeviceID, int ChannelID, int GroupID,
-    unsigned char EOL, int color, char color_brightness, char brightness,
-    char on_off, event_source_type eventSourceType, char *AlexaCorrelationToken,
-    char *GoogleRequestId) {
-  bool result = false;
-
-  safe_array_lock(supla_user::user_arr);
-  supla_user *user =
-      (supla_user *)safe_array_findcnd(user_arr, find_user_by_id, &UserID);
-  safe_array_unlock(supla_user::user_arr);
-
-  if (user) {
-    if (eventSourceType > 0) {
-      // TODO(anyone): Check it out. I think there should be "will change"
-      supla_http_request_queue::getInstance()->onChannelValueChangeEvent(
-          user, DeviceID, ChannelID, eventSourceType, AlexaCorrelationToken,
-          GoogleRequestId);
-    }
-
-    result = user->set_device_channel_rgbw_value(
-                 SenderID, DeviceID, ChannelID, GroupID, EOL, color,
-                 color_brightness, brightness, on_off) == true;
-  }
-
-  return result;
-}
-
-// static
-bool supla_user::set_channelgroup_char_value(int UserID, int GroupID,
-                                             const char value) {
-  bool result = false;
-
-  safe_array_lock(supla_user::user_arr);
-  supla_user *user =
-      (supla_user *)safe_array_findcnd(user_arr, find_user_by_id, &UserID);
-  safe_array_unlock(supla_user::user_arr);
-
-  if (user) result = user->set_channelgroup_char_value(GroupID, value) == true;
-
-  return result;
-}
-
-// static
-bool supla_user::set_channelgroup_rgbw_value(int UserID, int GroupID, int color,
-                                             char color_brightness,
-                                             char brightness, char on_off) {
-  bool result = false;
-
-  safe_array_lock(supla_user::user_arr);
-  supla_user *user =
-      (supla_user *)safe_array_findcnd(user_arr, find_user_by_id, &UserID);
-  safe_array_unlock(supla_user::user_arr);
-
-  if (user)
-    result = user->set_channelgroup_rgbw_value(GroupID, color, color_brightness,
-                                               brightness, on_off) == true;
 
   return result;
 }
@@ -829,7 +809,7 @@ void supla_user::on_state_webhook_changed(int UserID) {
 
 // static
 void supla_user::on_mqtt_settings_changed(int UserID) {
-  supla_mqtt_client_suite::globalInstance()->onUserSettingsChanged(UserID);
+  supla_mqtt_client_suite::globalInstance()->onUserDataChanged(UserID);
 }
 
 // static
@@ -973,40 +953,6 @@ bool supla_user::set_device_channel_value(
   return result;
 }
 
-bool supla_user::set_device_channel_char_value(int SenderID, int DeviceID,
-                                               int ChannelID, int GroupID,
-                                               unsigned char EOL,
-                                               const char value) {
-  bool result = false;
-
-  supla_device *device = device_container->findByID(DeviceID);
-  if (device) {
-    result = device->get_channels()->set_device_channel_char_value(
-        SenderID, ChannelID, GroupID, EOL, value);
-    device->releasePtr();
-  }
-
-  return result;
-}
-
-bool supla_user::set_device_channel_rgbw_value(int SenderID, int DeviceID,
-                                               int ChannelID, int GroupID,
-                                               unsigned char EOL, int color,
-                                               char color_brightness,
-                                               char brightness, char on_off) {
-  bool result = false;
-
-  supla_device *device = device_container->findByID(DeviceID);
-  if (device) {
-    result = device->get_channels()->set_device_channel_rgbw_value(
-        SenderID, ChannelID, GroupID, EOL, color, color_brightness, brightness,
-        on_off);
-    device->releasePtr();
-  }
-
-  return result;
-}
-
 bool supla_user::set_channelgroup_char_value(int GroupID, const char value) {
   return cgroups->set_char_value(GroupID, value);
 }
@@ -1035,18 +981,7 @@ void supla_user::on_channel_value_changed(event_source_type eventSourceType,
                                           bool Extended,
                                           bool SignificantChange) {
   std::list<channel_address> ca_list;
-
-  if (Extended) {
-    {
-      supla_client *client;
-
-      for (int a = 0; a < client_container->count(); a++)
-        if (NULL != (client = client_container->get(a))) {
-          client->on_channel_value_changed(DeviceId, ChannelId, true);
-          client->releasePtr();
-        }
-    }
-  }
+  ca_list.push_back(channel_address(DeviceId, ChannelId));
 
   supla_device *device = device_container->findByID(DeviceId);
   if (device) {
@@ -1068,28 +1003,17 @@ void supla_user::on_channel_value_changed(event_source_type eventSourceType,
     }
   }
 
-  bool source_added = false;
-  if (ca_list.empty()) {
-    ca_list.push_back(channel_address(DeviceId, ChannelId));
-    source_added = true;
-  }
+  supla_client *client = NULL;
 
-  if (!Extended) {
-    supla_client *client;
-
-    for (int a = 0; a < client_container->count(); a++)
-      if (NULL != (client = client_container->get(a))) {
-        for (std::list<channel_address>::iterator it = ca_list.begin();
-             it != ca_list.end(); it++) {
-          client->on_channel_value_changed(it->getDeviceId(),
-                                           it->getChannelId());
-        }
-        client->releasePtr();
+  for (int a = 0; a < client_container->count(); a++) {
+    if (NULL != (client = client_container->get(a))) {
+      for (std::list<channel_address>::iterator it = ca_list.begin();
+           it != ca_list.end(); it++) {
+        client->on_channel_value_changed(it->getDeviceId(), it->getChannelId(),
+                                         Extended);
       }
-  }
-
-  if (!source_added) {
-    ca_list.push_back(channel_address(DeviceId, ChannelId));
+      client->releasePtr();
+    }
   }
 
   for (std::list<channel_address>::iterator it = ca_list.begin();
@@ -1528,15 +1452,15 @@ void supla_user::set_channel_function(supla_client *sender,
   sender->set_channel_function_result(&result);
 }
 
-void supla_user::set_channel_caption(supla_client *sender,
-                                     TCS_SetChannelCaption *caption) {
+void supla_user::set_caption(supla_client *sender, TCS_SetCaption *caption,
+                             bool channel) {
   if (sender == NULL || caption == NULL) {
     return;
   }
 
-  TSC_SetChannelCaptionResult result;
-  memset(&result, 0, sizeof(TSC_SetChannelCaptionResult));
-  result.ChannelID = caption->ChannelID;
+  TSC_SetCaptionResult result;
+  memset(&result, 0, sizeof(TSC_SetCaptionResult));
+  result.ID = caption->ID;
   memcpy(result.Caption, caption->Caption, SUPLA_CHANNEL_CAPTION_MAXSIZE);
   result.CaptionSize = caption->CaptionSize;
   if (result.CaptionSize > SUPLA_CHANNEL_CAPTION_MAXSIZE) {
@@ -1550,8 +1474,8 @@ void supla_user::set_channel_caption(supla_client *sender,
     database *db = new database();
 
     if (db->connect()) {
-      if (db->set_channel_caption(getUserID(), caption->ChannelID,
-                                  caption->Caption)) {
+      if (db->set_caption(getUserID(), caption->ID, caption->Caption,
+                          channel)) {
         result.ResultCode = SUPLA_RESULTCODE_TRUE;
       } else {
         result.ResultCode = SUPLA_RESULTCODE_UNKNOWN_ERROR;
@@ -1567,12 +1491,17 @@ void supla_user::set_channel_caption(supla_client *sender,
 
     for (int a = 0; a < client_container->count(); a++)
       if (NULL != (client = client_container->get(a))) {
-        client->set_channel_caption(caption->ChannelID, caption->Caption);
+        if (channel) {
+          client->set_channel_caption(caption->ID, caption->Caption);
+        } else {
+          client->set_location_caption(caption->ID, caption->Caption);
+        }
+
         client->releasePtr();
       }
   }
 
-  sender->set_channel_caption_result(&result);
+  sender->set_caption_result(&result, channel);
 }
 
 supla_amazon_alexa_credentials *supla_user::amazonAlexaCredentials(void) {
