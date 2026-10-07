@@ -539,8 +539,10 @@ void supla_abstract_common_channel_properties::get_config(
 
       return;
     }
-  } else if (get_type() == SUPLA_CHANNELTYPE_IMPULSE_COUNTER &&
-             config_type == SUPLA_CONFIG_TYPE_OCR) {
+  }
+
+  if (get_type() == SUPLA_CHANNELTYPE_IMPULSE_COUNTER &&
+      config_type == SUPLA_CONFIG_TYPE_OCR) {
     JSON_TO_CONFIG(ocr_config, TChannelConfig_OCR, config, config_size);
   } else if (config_type == SUPLA_CONFIG_TYPE_EXTENDED &&
              get_func() == SUPLA_CHANNELFNC_STAIRCASETIMER) {
@@ -698,6 +700,16 @@ int supla_abstract_common_channel_properties::set_user_config(
   if (config_size > SUPLA_CHANNEL_CONFIG_MAXSIZE || !config) {
     return SUPLA_CONFIG_RESULT_FALSE;
   }
+
+  // Several branches below cast the buffer to a TChannelConfig_* structure
+  // without comparing config_size with its size. Work on a zero-padded copy
+  // so that bytes not sent by the peer are never interpreted (and stored in
+  // the JSON config) as configuration values.
+  char zero_padded_config[SUPLA_CHANNEL_CONFIG_MAXSIZE] = {};
+  if (config_size) {
+    memcpy(zero_padded_config, config, config_size);
+  }
+  config = zero_padded_config;
 
   int result = SUPLA_CONFIG_RESULT_FALSE;
 
