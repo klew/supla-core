@@ -97,8 +97,9 @@ void ActionExecutorTest::SetUp() {
 }
 
 void ActionExecutorTest::TearDown() {
-  delete supla_user::find(12345, false);
   delete aexec;
+  device.reset();
+  delete supla_user::find(12345, false);
 }
 
 TEST_F(ActionExecutorTest, getDeviceWithAndWithoutId) {
